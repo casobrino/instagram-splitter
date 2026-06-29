@@ -1,0 +1,10 @@
+[package]
+name = "instagram-splitter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+image = { version = "0.25", features = ["jpeg", "png"] }
+rfd = "0.15"
