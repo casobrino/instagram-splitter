@@ -1,9 +1,13 @@
+mod cine;
 mod polaroid;
 mod splitter;
 
 use eframe::egui::{self, Color32, Pos2, Rect, TextureHandle, Vec2};
 use image::{DynamicImage, GenericImageView, ImageFormat};
 
+use cine::{
+    show_cine_preview, CineCanvas, CinePreviewEvent, CineStripCount, CineStripView, PanelOffset,
+};
 use polaroid::{
     show_frame_background_controls, show_polaroid_adjustment_controls, show_polaroid_preview,
     FrameBackground, ImagePlacement, PolaroidFormat, DEFAULT_BOTTOM_PADDING, MAX_BOTTOM_PADDING,
@@ -41,6 +45,23 @@ enum AppTab {
     #[default]
     Splitter,
     Polaroid,
+    Cine,
+}
+
+struct CineStripSlot {
+    image: Option<DynamicImage>,
+    texture: Option<TextureHandle>,
+    offset: PanelOffset,
+}
+
+impl Default for CineStripSlot {
+    fn default() -> Self {
+        Self {
+            image: None,
+            texture: None,
+            offset: PanelOffset::default(),
+        }
+    }
 }
 
 struct App {
@@ -63,11 +84,18 @@ struct App {
     polaroid_bottom_padding: f32,
     polaroid_output: Option<DynamicImage>,
     polaroid_output_texture: Option<TextureHandle>,
+
+    cine_canvas: CineCanvas,
+    cine_strip_count: CineStripCount,
+    cine_slots: Vec<CineStripSlot>,
+    cine_selected_strip: Option<usize>,
+    cine_output: Option<Vec<DynamicImage>>,
+    cine_output_textures: Option<Vec<TextureHandle>>,
 }
 
 impl Default for App {
     fn default() -> Self {
-        Self {
+        let mut app = Self {
             active_tab: AppTab::default(),
             status: String::new(),
             original_image: None,
@@ -85,7 +113,15 @@ impl Default for App {
             polaroid_bottom_padding: DEFAULT_BOTTOM_PADDING,
             polaroid_output: None,
             polaroid_output_texture: None,
-        }
+            cine_canvas: CineCanvas::default(),
+            cine_strip_count: CineStripCount::default(),
+            cine_slots: Vec::new(),
+            cine_selected_strip: None,
+            cine_output: None,
+            cine_output_textures: None,
+        };
+        app.ensure_cine_slots();
+        app
     }
 }
 
@@ -117,6 +153,69 @@ impl App {
     fn invalidate_polaroid_output(&mut self) {
         self.polaroid_output = None;
         self.polaroid_output_texture = None;
+    }
+
+    fn ensure_cine_slots(&mut self) {
+        let n = self.cine_strip_count.as_usize();
+        self.cine_slots.resize_with(n, CineStripSlot::default);
+        if self.cine_selected_strip.map(|i| i >= n) == Some(true) {
+            self.cine_selected_strip = None;
+        }
+    }
+
+    fn cine_filled_count(&self) -> usize {
+        self.cine_slots.iter().filter(|s| s.image.is_some()).count()
+    }
+
+    fn cine_all_slots_filled(&self) -> bool {
+        let n = self.cine_strip_count.as_usize();
+        self.cine_slots.len() == n && self.cine_slots.iter().all(|s| s.image.is_some())
+    }
+
+    fn next_empty_cine_slot(&self) -> Option<usize> {
+        self.cine_slots.iter().position(|s| s.image.is_none())
+    }
+
+    fn invalidate_cine_output(&mut self) {
+        self.cine_output = None;
+        self.cine_output_textures = None;
+    }
+
+    fn set_cine_strip_image(&mut self, ctx: &egui::Context, idx: usize, img: DynamicImage) {
+        if idx >= self.cine_slots.len() {
+            return;
+        }
+        let slot = &mut self.cine_slots[idx];
+        slot.texture = Some(dynamic_image_to_texture(
+            ctx,
+            &format!("cine_strip_{idx}"),
+            &img,
+        ));
+        slot.offset = cine::default_offset_for_strip();
+        slot.image = Some(img);
+        self.cine_selected_strip = Some(idx);
+        self.invalidate_cine_output();
+    }
+
+    fn pick_cine_image_for_slot(&mut self, ctx: &egui::Context, idx: usize) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Imágenes", &["jpg", "jpeg", "png"])
+            .pick_file()
+        {
+            match image::open(&path) {
+                Ok(img) => {
+                    self.set_cine_strip_image(ctx, idx, img);
+                    self.status = format!(
+                        "Tira {}: {}",
+                        idx + 1,
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                }
+                Err(err) => {
+                    self.status = format!("Error al abrir la imagen: {err}");
+                }
+            }
+        }
     }
 
     fn open_image(&mut self, ctx: &egui::Context) {
@@ -176,6 +275,15 @@ impl App {
         }
     }
 
+    fn open_cine_image(&mut self, ctx: &egui::Context) {
+        self.ensure_cine_slots();
+        let idx = self
+            .cine_selected_strip
+            .or_else(|| self.next_empty_cine_slot())
+            .unwrap_or(0);
+        self.pick_cine_image_for_slot(ctx, idx);
+    }
+
     fn convert_image(&mut self, ctx: &egui::Context) {
         let Some(original) = self.original_image.as_ref() else {
             self.status = "Primero abre una imagen".to_string();
@@ -233,6 +341,35 @@ impl App {
         self.status = format!("Polaroid listo ({w}×{h} px).");
     }
 
+    fn generate_cine(&mut self, ctx: &egui::Context) {
+        if !self.cine_all_slots_filled() {
+            self.status = "Añade una imagen a cada tira antes de generar".to_string();
+            return;
+        }
+        let images: Vec<&DynamicImage> = self
+            .cine_slots
+            .iter()
+            .map(|s| s.image.as_ref().unwrap())
+            .collect();
+        let offsets: Vec<PanelOffset> = self.cine_slots.iter().map(|s| s.offset).collect();
+        let outputs = cine::render_cine(
+            &images,
+            &offsets,
+            self.cine_canvas,
+            self.cine_strip_count,
+        );
+        let textures = outputs
+            .iter()
+            .enumerate()
+            .map(|(i, img)| dynamic_image_to_texture(ctx, &format!("cine_out_{}", i + 1), img))
+            .collect();
+        let n = outputs.len();
+        let (sw, sh) = self.cine_canvas.strip_output_size(self.cine_strip_count);
+        self.cine_output = Some(outputs);
+        self.cine_output_textures = Some(textures);
+        self.status = format!("{n} tiras generadas ({sw}×{sh} px cada una).");
+    }
+
     fn save_images(&mut self) {
         let Some(outputs) = self.output_images.as_ref() else {
             self.status = "Primero convierte una imagen".to_string();
@@ -275,6 +412,27 @@ impl App {
         }
     }
 
+    fn save_cine_images(&mut self) {
+        let Some(outputs) = self.cine_output.as_ref() else {
+            self.status = "Primero genera las tiras".to_string();
+            return;
+        };
+        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+            let mut errors = Vec::new();
+            for (i, img) in outputs.iter().enumerate() {
+                let path = folder.join(format!("cine_{}.jpg", i + 1));
+                if let Err(err) = img.save_with_format(&path, ImageFormat::Jpeg) {
+                    errors.push(format!("cine_{}: {err}", i + 1));
+                }
+            }
+            if errors.is_empty() {
+                self.status = format!("Guardado en {}", folder.to_string_lossy());
+            } else {
+                self.status = format!("Error: {}", errors.join("; "));
+            }
+        }
+    }
+
     // ─── Sidebar ────────────────────────────────────────────────────────────
 
     fn show_sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -302,6 +460,7 @@ impl App {
                 match self.active_tab {
                     AppTab::Splitter => self.show_splitter_sidebar_content(ui),
                     AppTab::Polaroid => self.show_polaroid_sidebar_content(ui),
+                    AppTab::Cine => self.show_cine_sidebar_content(ui),
                 }
             });
 
@@ -403,6 +562,52 @@ impl App {
         }
     }
 
+    fn show_cine_sidebar_content(&mut self, ui: &mut egui::Ui) {
+        sidebar_label(ui, "Lienzo de salida");
+        ui.add_space(6.0);
+        self.show_cine_canvas_cards(ui);
+
+        ui.add_space(14.0);
+        sidebar_label(ui, "Número de tiras");
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for count in CineStripCount::all() {
+                let selected = self.cine_strip_count == count;
+                let btn = egui::Button::new(count.label())
+                    .min_size(Vec2::new(100.0, 32.0))
+                    .fill(if selected {
+                        TEAL
+                    } else {
+                        CARD_BG
+                    });
+                if ui.add(btn).clicked() {
+                    self.cine_strip_count = count;
+                    self.ensure_cine_slots();
+                    self.invalidate_cine_output();
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+        let filled = self.cine_filled_count();
+        let total = self.cine_strip_count.as_usize();
+        sidebar_label(ui, &format!("Imágenes ({filled}/{total})"));
+        ui.add_space(4.0);
+        for i in 0..total {
+            let has_image = self.cine_slots.get(i).is_some_and(|s| s.image.is_some());
+            let is_selected = self.cine_selected_strip == Some(i);
+            let label = if has_image {
+                format!("Tira {} — imagen cargada", i + 1)
+            } else {
+                format!("Tira {} — vacía", i + 1)
+            };
+            if ui.selectable_label(is_selected, label).clicked() {
+                self.cine_selected_strip = Some(i);
+            }
+        }
+    }
+
     fn show_action_buttons(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -471,6 +676,44 @@ impl App {
                         .clicked()
                     {
                         self.save_polaroid();
+                    }
+                }
+                AppTab::Cine => {
+                    let filled = self.cine_filled_count();
+                    let total = self.cine_strip_count.as_usize();
+                    let btn_label = if filled < total {
+                        "Añadir imagen"
+                    } else {
+                        "Cambiar imagen"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(btn_label).min_size(Vec2::new(100.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        self.open_cine_image(ctx);
+                    }
+                    let can_gen = self.cine_all_slots_filled();
+                    let btn = egui::Button::new("Generar")
+                        .fill(if can_gen {
+                            ACCENT
+                        } else {
+                            Color32::from_gray(48)
+                        })
+                        .min_size(Vec2::new(78.0, 32.0));
+                    if ui.add_enabled(can_gen, btn).clicked() {
+                        self.generate_cine(ctx);
+                    }
+                    let can_save = self.cine_output.is_some();
+                    if ui
+                        .add_enabled(
+                            can_save,
+                            egui::Button::new("Guardar").min_size(Vec2::new(62.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        self.save_cine_images();
                     }
                 }
             }
@@ -542,12 +785,29 @@ impl App {
         }
     }
 
+    fn show_cine_canvas_cards(&mut self, ui: &mut egui::Ui) {
+        let card_w = ((SIDEBAR_W - 32.0 - 8.0) / 2.0).floor();
+        let card_h = 118.0_f32;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for canvas in CineCanvas::all() {
+                let selected = self.cine_canvas == canvas;
+                if draw_cine_canvas_card(ui, canvas, selected, Vec2::new(card_w, card_h)) {
+                    self.cine_canvas = canvas;
+                    self.invalidate_cine_output();
+                }
+            }
+        });
+    }
+
     // ─── Preview panel ──────────────────────────────────────────────────────
 
     fn show_preview(&mut self, ui: &mut egui::Ui) {
         match self.active_tab {
             AppTab::Splitter => self.show_splitter_preview(ui),
             AppTab::Polaroid => self.show_polaroid_preview_panel(ui),
+            AppTab::Cine => self.show_cine_preview_panel(ui),
         }
     }
 
@@ -625,6 +885,62 @@ impl App {
             });
     }
 
+    fn show_cine_preview_panel(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.ensure_cine_slots();
+                let n = self.cine_strip_count.as_usize();
+
+                let mut views: Vec<CineStripView<'_>> = self
+                    .cine_slots
+                    .iter_mut()
+                    .take(n)
+                    .map(|slot| CineStripView {
+                        texture: slot.texture.as_ref(),
+                        dims: slot.image.as_ref().map(|img| img.dimensions()),
+                        offset: &mut slot.offset,
+                    })
+                    .collect();
+
+                match show_cine_preview(
+                    ui,
+                    &mut views,
+                    self.cine_canvas,
+                    self.cine_strip_count,
+                    self.cine_selected_strip,
+                    ACCENT,
+                ) {
+                    CinePreviewEvent::OffsetChanged => self.invalidate_cine_output(),
+                    CinePreviewEvent::StripClicked(i) => {
+                        self.cine_selected_strip = Some(i);
+                        self.pick_cine_image_for_slot(&ctx, i);
+                    }
+                    CinePreviewEvent::None => {}
+                }
+
+                if let Some(textures) = &self.cine_output_textures {
+                    ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("Tiras generadas").strong());
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        for (i, tex) in textures.iter().enumerate() {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("Tira {}", i + 1)).weak(),
+                                );
+                                show_texture_preview(ui, tex, 280.0);
+                            });
+                        }
+                    });
+                }
+            });
+    }
+
     // ─── Status bar ─────────────────────────────────────────────────────────
 
     fn show_status_bar(&self, ui: &mut egui::Ui) {
@@ -683,6 +999,18 @@ impl App {
                                 .weak(),
                         );
                     }
+                }
+                AppTab::Cine => {
+                    let (w, h) = self.cine_canvas.output_size();
+                    let n = self.cine_strip_count.as_usize();
+                    let filled = self.cine_filled_count();
+                    let (sw, sh) = self.cine_canvas.strip_output_size(self.cine_strip_count);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{w}×{h}  ·  {filled}/{n} imágenes  ·  {sw}×{sh} px por tira"
+                        ))
+                        .small(),
+                    );
                 }
             }
 
@@ -754,25 +1082,27 @@ fn show_mode_toggle(ui: &mut egui::Ui, active_tab: &mut AppTab) {
 
     painter.rect_filled(rect, h / 2.0, Color32::from_gray(38));
 
-    let half = w / 2.0;
+    let third = w / 3.0;
     let sel_x = match active_tab {
         AppTab::Splitter => rect.min.x,
-        AppTab::Polaroid => rect.min.x + half,
+        AppTab::Polaroid => rect.min.x + third,
+        AppTab::Cine => rect.min.x + 2.0 * third,
     };
     let sel_rect =
-        Rect::from_min_size(Pos2::new(sel_x, rect.min.y), Vec2::new(half, h));
+        Rect::from_min_size(Pos2::new(sel_x, rect.min.y), Vec2::new(third, h));
     painter.rect_filled(sel_rect, h / 2.0, ACCENT);
 
-    for (i, label) in ["RECORTE", "POLAROID"].iter().enumerate() {
+    for (i, label) in ["RECORTE", "POLAROID", "CINE"].iter().enumerate() {
         let is_active = match i {
             0 => *active_tab == AppTab::Splitter,
-            _ => *active_tab == AppTab::Polaroid,
+            1 => *active_tab == AppTab::Polaroid,
+            _ => *active_tab == AppTab::Cine,
         };
         painter.text(
-            Pos2::new(rect.min.x + half * i as f32 + half / 2.0, rect.center().y),
+            Pos2::new(rect.min.x + third * i as f32 + third / 2.0, rect.center().y),
             egui::Align2::CENTER_CENTER,
             label,
-            egui::FontId::proportional(12.0),
+            egui::FontId::proportional(11.0),
             if is_active {
                 Color32::WHITE
             } else {
@@ -783,10 +1113,13 @@ fn show_mode_toggle(ui: &mut egui::Ui, active_tab: &mut AppTab) {
 
     if response.clicked() {
         if let Some(pos) = response.interact_pointer_pos() {
-            *active_tab = if pos.x < rect.center().x {
+            let rel = pos.x - rect.min.x;
+            *active_tab = if rel < third {
                 AppTab::Splitter
-            } else {
+            } else if rel < 2.0 * third {
                 AppTab::Polaroid
+            } else {
+                AppTab::Cine
             };
         }
     }
@@ -996,6 +1329,109 @@ fn draw_polaroid_format_card(
             Pos2::new(rect.center().x, rect.max.y - 10.0),
             egui::Align2::CENTER_BOTTOM,
             format.size_label(),
+            egui::FontId::proportional(9.0),
+            sub_color,
+        );
+    }
+
+    response.clicked()
+}
+
+fn draw_cine_canvas_card(
+    ui: &mut egui::Ui,
+    canvas: CineCanvas,
+    selected: bool,
+    size: Vec2,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let hovered = response.hovered();
+
+        let bg = if selected {
+            TEAL
+        } else if hovered {
+            Color32::from_gray(52)
+        } else {
+            CARD_BG
+        };
+        let stroke_color = if selected {
+            Color32::from_rgb(80, 200, 150)
+        } else if hovered {
+            Color32::from_gray(100)
+        } else {
+            Color32::from_gray(58)
+        };
+
+        painter.rect_filled(rect, 8.0, bg);
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(if selected { 1.5 } else { 1.0 }, stroke_color),
+            egui::StrokeKind::Inside,
+        );
+
+        let margin = 10.0;
+        let icon_area = Rect::from_min_size(
+            rect.min + Vec2::new(margin, margin),
+            Vec2::new(size.x - 2.0 * margin, size.y * 0.50 - margin),
+        );
+
+        let (out_w, out_h) = canvas.output_size();
+        let frame_aspect = out_w as f32 / out_h as f32;
+        let area_aspect = icon_area.width() / icon_area.height();
+        let (fw, fh) = if frame_aspect > area_aspect {
+            (icon_area.width(), icon_area.width() / frame_aspect)
+        } else {
+            (icon_area.height() * frame_aspect, icon_area.height())
+        };
+        let icon_rect =
+            Rect::from_center_size(icon_area.center(), Vec2::new(fw, fh));
+        let icon_fill = if selected {
+            Color32::WHITE
+        } else {
+            Color32::from_gray(145)
+        };
+
+        let n = 3usize;
+        let gap = 1.5;
+        let strip_h = (fh - gap * (n as f32 - 1.0)) / n as f32;
+        for i in 0..n {
+            let y = icon_rect.min.y + i as f32 * (strip_h + gap);
+            painter.rect_filled(
+                Rect::from_min_size(
+                    Pos2::new(icon_rect.min.x, y),
+                    Vec2::new(fw, strip_h),
+                ),
+                1.5,
+                icon_fill,
+            );
+        }
+
+        let text_y = rect.min.y + size.y * 0.58;
+        let text_color = if selected {
+            Color32::WHITE
+        } else {
+            Color32::from_gray(210)
+        };
+        let sub_color = if selected {
+            Color32::from_rgb(190, 245, 220)
+        } else {
+            Color32::from_gray(105)
+        };
+
+        painter.text(
+            Pos2::new(rect.center().x, text_y),
+            egui::Align2::CENTER_TOP,
+            canvas.label(),
+            egui::FontId::proportional(13.0),
+            text_color,
+        );
+        painter.text(
+            Pos2::new(rect.center().x, rect.max.y - 10.0),
+            egui::Align2::CENTER_BOTTOM,
+            canvas.size_label(),
             egui::FontId::proportional(9.0),
             sub_color,
         );
