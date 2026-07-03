@@ -1,0 +1,85 @@
+name: Release
+
+# Builds Windows and macOS binaries and attaches them to a GitHub Release.
+# Trigger by pushing a tag like v1.0.0, or run manually from the Actions tab.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x86_64
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            name: macos-aarch64
+            target: aarch64-apple-darwin
+          - os: macos-13
+            name: macos-x86_64
+            target: x86_64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ---- Windows: zip the .exe ----
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "instagram-splitter-${{ matrix.name }}"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/instagram-splitter.exe" "$dir/"
+          Copy-Item "README.md" "$dir/"
+          Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip" -Force
+
+      # ---- macOS: build .app bundle and zip it ----
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP_NAME="Instagram Photo Splitter"
+          BIN="target/${{ matrix.target }}/release/instagram-splitter"
+          APP_DIR="dist/$APP_NAME.app"
+          rm -rf dist && mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+          cp "$BIN" "$APP_DIR/Contents/MacOS/instagram-splitter"
+          chmod +x "$APP_DIR/Contents/MacOS/instagram-splitter"
+          cp packaging/macos/Info.plist "$APP_DIR/Contents/Info.plist"
+          xattr -cr "$APP_DIR" || true
+          cd dist
+          zip -ry "../instagram-splitter-${{ matrix.name }}.zip" "$APP_NAME.app"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: instagram-splitter-${{ matrix.name }}
+          path: instagram-splitter-${{ matrix.name }}.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: instagram-splitter-${{ matrix.name }}.zip
