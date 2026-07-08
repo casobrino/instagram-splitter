@@ -1,5 +1,5 @@
 use eframe::egui::{self, Color32, Pos2, Rect, TextureHandle, Vec2};
-use image::{DynamicImage, GenericImageView};
+use image::{DynamicImage, GenericImageView, RgbaImage};
 
 use crate::splitter::OUTPUT_WIDTH;
 
@@ -182,12 +182,18 @@ pub fn render_cine(
     offsets: &[PanelOffset],
     canvas: CineCanvas,
     strip_count: CineStripCount,
-) -> Vec<DynamicImage> {
-    images
-        .iter()
-        .zip(offsets.iter())
-        .map(|(image, offset)| render_cine_strip(image, offset, canvas, strip_count))
-        .collect()
+) -> DynamicImage {
+    let (out_w, out_h) = canvas.output_size();
+    let (_, strip_h) = canvas.strip_output_size(strip_count);
+    let mut combined = RgbaImage::new(out_w, out_h);
+
+    for (i, (image, offset)) in images.iter().zip(offsets.iter()).enumerate() {
+        let strip = render_cine_strip(image, offset, canvas, strip_count);
+        let y = (i as u32) * strip_h;
+        image::imageops::overlay(&mut combined, &strip.to_rgba8(), 0, y as i64);
+    }
+
+    DynamicImage::ImageRgba8(combined)
 }
 
 pub struct CineStripView<'a> {

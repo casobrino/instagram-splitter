@@ -89,8 +89,8 @@ struct App {
     cine_strip_count: CineStripCount,
     cine_slots: Vec<CineStripSlot>,
     cine_selected_strip: Option<usize>,
-    cine_output: Option<Vec<DynamicImage>>,
-    cine_output_textures: Option<Vec<TextureHandle>>,
+    cine_output: Option<DynamicImage>,
+    cine_output_texture: Option<TextureHandle>,
 }
 
 impl Default for App {
@@ -118,7 +118,7 @@ impl Default for App {
             cine_slots: Vec::new(),
             cine_selected_strip: None,
             cine_output: None,
-            cine_output_textures: None,
+            cine_output_texture: None,
         };
         app.ensure_cine_slots();
         app
@@ -178,7 +178,7 @@ impl App {
 
     fn invalidate_cine_output(&mut self) {
         self.cine_output = None;
-        self.cine_output_textures = None;
+        self.cine_output_texture = None;
     }
 
     fn set_cine_strip_image(&mut self, ctx: &egui::Context, idx: usize, img: DynamicImage) {
@@ -352,22 +352,17 @@ impl App {
             .map(|s| s.image.as_ref().unwrap())
             .collect();
         let offsets: Vec<PanelOffset> = self.cine_slots.iter().map(|s| s.offset).collect();
-        let outputs = cine::render_cine(
+        let output = cine::render_cine(
             &images,
             &offsets,
             self.cine_canvas,
             self.cine_strip_count,
         );
-        let textures = outputs
-            .iter()
-            .enumerate()
-            .map(|(i, img)| dynamic_image_to_texture(ctx, &format!("cine_out_{}", i + 1), img))
-            .collect();
-        let n = outputs.len();
-        let (sw, sh) = self.cine_canvas.strip_output_size(self.cine_strip_count);
-        self.cine_output = Some(outputs);
-        self.cine_output_textures = Some(textures);
-        self.status = format!("{n} tiras generadas ({sw}×{sh} px cada una).");
+        let texture = dynamic_image_to_texture(ctx, "cine_output", &output);
+        let (w, h) = self.cine_canvas.output_size();
+        self.cine_output = Some(output);
+        self.cine_output_texture = Some(texture);
+        self.status = format!("Imagen cine lista ({w}×{h} px).");
     }
 
     fn save_images(&mut self) {
@@ -413,22 +408,22 @@ impl App {
     }
 
     fn save_cine_images(&mut self) {
-        let Some(outputs) = self.cine_output.as_ref() else {
-            self.status = "Primero genera las tiras".to_string();
+        let Some(output) = self.cine_output.as_ref() else {
+            self.status = "Primero genera la imagen".to_string();
             return;
         };
-        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-            let mut errors = Vec::new();
-            for (i, img) in outputs.iter().enumerate() {
-                let path = folder.join(format!("cine_{}.jpg", i + 1));
-                if let Err(err) = img.save_with_format(&path, ImageFormat::Jpeg) {
-                    errors.push(format!("cine_{}: {err}", i + 1));
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JPEG", &["jpg", "jpeg"])
+            .set_file_name("cine.jpg")
+            .save_file()
+        {
+            match output.save_with_format(&path, ImageFormat::Jpeg) {
+                Ok(()) => {
+                    self.status = format!("Guardado en {}", path.to_string_lossy());
                 }
-            }
-            if errors.is_empty() {
-                self.status = format!("Guardado en {}", folder.to_string_lossy());
-            } else {
-                self.status = format!("Error: {}", errors.join("; "));
+                Err(err) => {
+                    self.status = format!("Error: {err}");
+                }
             }
         }
     }
@@ -920,23 +915,13 @@ impl App {
                     CinePreviewEvent::None => {}
                 }
 
-                if let Some(textures) = &self.cine_output_textures {
+                if let Some(out_tex) = &self.cine_output_texture {
                     ui.add_space(20.0);
                     ui.separator();
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new("Tiras generadas").strong());
+                    ui.label(egui::RichText::new("Resultado generado").strong());
                     ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
-                        for (i, tex) in textures.iter().enumerate() {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("Tira {}", i + 1)).weak(),
-                                );
-                                show_texture_preview(ui, tex, 280.0);
-                            });
-                        }
-                    });
+                    show_texture_preview(ui, out_tex, 400.0);
                 }
             });
     }
